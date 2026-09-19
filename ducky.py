@@ -47,7 +47,8 @@ MAX_HISTORY = 10                 # messages of context sent each turn (lower = f
 
 # voice: am_michael (default), am_fenrir, am_puck, am_adam, am_eric, am_liam, am_onyx
 #        british: bm_george, bm_lewis, bm_daniel, bm_fable
-VOICE = "am_michael"
+# VOICE = "am_michael"
+VOICE = "af_heart"
 SPEED = 1.1                      # 1.0 = normal, 0.9 = calmer, 1.2 = brisk
 KOKORO_MODEL = "kokoro-v1.0.int8.onnx"  # ~2x faster than "kokoro-v1.0.onnx" (full quality, slower)
 TTS_ENGINE = "auto"              # "auto": Kokoro if this CPU runs it fast enough, otherwise Piper. Or force "kokoro" / "piper"
@@ -175,32 +176,93 @@ line_open = False                # a line is in progress (we've seen its first p
 line_tainted = False             # ...and it began while the AI was talking, so it contains echo
 
 WAKE_WORD = "ducky"
+# Alternate names / likely speech-recognition spellings for the wake word.
+# Longer phrases are checked first, then one-word aliases, with a little
+# fuzzy matching so small transcription errors still wake the assistant.
+WAKE_ALIASES = (
+    "dokey donkey",
+    "ducky",
+    "loki",
+    "dokey",
+    "donkey",
+    "doggy",
+    "duckie",
+    "dukie",
+    "duckee",
+)
+WAKE_FUZZY_CUTOFF = 0.72
 WAKE_TIMEOUT_S = 5.0
+
+# Once a wake word starts a conversation, follow-up turns are accepted naturally
+# without needing to say the wake word again. Say a wake name again during the
+# conversation and it is simply stripped before the message is sent to Ollama.
+CONVERSATION_MODE = True
+# Once Ducky has been woken, keep accepting normal follow-up turns.
+# This stays active until the program is restarted; saying a wake alias again
+# during the conversation is optional and is stripped from the message.
+conversation_active = False
+
 wake_armed_until = 0.0
 
-WAKE_RE = re.compile(
-    r"^\s*(?:hey\s+)?ducky\b[\s,:;-]*(.*)$",
-    re.IGNORECASE
-)
+
+def _wake_match(words):
+    """Return the number of leading words consumed by a wake alias, or 0."""
+    if not words:
+        return 0
+
+    for alias in sorted(WAKE_ALIASES, key=lambda value: len(value.split()), reverse=True):
+        expected = alias.split()
+        if len(words) < len(expected):
+            continue
+        candidate = words[:len(expected)]
+        if all(
+            actual == wanted
+            or difflib.SequenceMatcher(None, actual, wanted).ratio() >= WAKE_FUZZY_CUTOFF
+            for actual, wanted in zip(candidate, expected)
+        ):
+            return len(expected)
+    return 0
 
 
 def extract_wake_command(text: str):
     """
     Returns:
-        ("command", command_text) if wake word + command were spoken
-        ("wake_only", "") if only 'ducky' / 'hey ducky' was spoken
-        (None, None) if no wake word was used
+        ("command", command_text) if wake alias + command were spoken
+        ("wake_only", "") if only a wake alias was spoken
+        (None, None) if no wake alias was used
+
+    The wake alias is removed from the command so that "hey ducky, tell me
+    about X" sends only "tell me about X" to the model.
     """
-    match = WAKE_RE.match(text)
-    if not match:
+    words = tokens(text)
+    if not words:
         return None, None
 
-    command = match.group(1).strip()
+    # Optional "hey" before the wake name.
+    start = 1 if words[0] == "hey" else 0
+    wake_len = _wake_match(words[start:])
+    if not wake_len:
+        return None, None
 
+    command = " ".join(words[start + wake_len:]).strip()
     if command:
         return "command", command
-
     return "wake_only", ""
+
+
+def strip_wake_prefix(text: str):
+    """
+    Remove an optional wake alias from the beginning of a message.
+    Used during an active conversation so "hey ducky, what about Y?"
+    becomes simply "what about Y?". Returns the original text when no
+    wake alias is present.
+    """
+    wake_type, command = extract_wake_command(text)
+    if wake_type == "command":
+        return command
+    if wake_type == "wake_only":
+        return ""
+    return text.strip()
 
 
 # ---------- helpers ----------
@@ -1039,7 +1101,7 @@ def arm_turn(delay: float) -> None:
 
 def commit_turn() -> None:
     """You've been quiet long enough: act on everything you said as one message."""
-    global turn_timer, pending_resume
+    global turn_timer, pending_resume, conversation_active
     with turn_lock:
         text = " ".join(turn_parts)
         turn_parts.clear()
@@ -1058,34 +1120,48 @@ def commit_turn() -> None:
         resume_now()
         return
 
-    # ---------------- wake word gate ----------------
-    # Normal speech is ignored unless it starts with "ducky" or "Hey ducky".
-    # Saying only "ducky" / "Hey ducky" arms the assistant for a few seconds,
-    # so you can pause naturally and then give the command.
-    global wake_armed_until
+    # ---------------- wake word gate / conversation mode ----------------
+    # First turn requires a wake alias. After that, every normal line is a
+    # follow-up turn until the program is restarted. A repeated wake alias is
+    # optional and is removed before the text is sent to Ollama.
+    global wake_armed_until, conversation_active
 
     now = time.time()
     wake_type, command = extract_wake_command(text)
 
-    # "ducky, ..." or "Hey ducky, ..."
+    # "Hey ducky, ..." / "Loki, ..." / etc. starts the conversation and sends
+    # only the actual request to Ollama.
     if wake_type == "command":
         wake_armed_until = 0.0
+        if CONVERSATION_MODE:
+            conversation_active = True
         lines_q.put((command, command))
         return
 
-    # Just "ducky" / "Hey ducky"
+    # Just the wake alias: give the user a few seconds to continue naturally.
     if wake_type == "wake_only":
         wake_armed_until = now + WAKE_TIMEOUT_S
         print('  [ducky listening]', flush=True)
         return
 
-    # We recently heard "ducky", so accept the next line as the command.
+    # A command spoken immediately after the wake-only line.
     if now < wake_armed_until:
         wake_armed_until = 0.0
+        if CONVERSATION_MODE:
+            conversation_active = True
         lines_q.put((text, text))
         return
 
-    # Otherwise, ignore ordinary speech.
+    # Natural follow-up turns: no wake word required.
+    # "Hey ducky" can still be said conversationally, but it is stripped.
+    if CONVERSATION_MODE and conversation_active:
+        follow_up = strip_wake_prefix(text)
+        if follow_up:
+            print(f"  [follow-up] {follow_up}", flush=True) if SHOW_DEBUG else None
+            lines_q.put((follow_up, follow_up))
+        return
+
+    # Before the first wake, ignore ordinary speech.
     if SHOW_DEBUG:
         print(f"  [ignored - no wake word] {text}", flush=True)
     return
@@ -1170,7 +1246,7 @@ def main() -> None:
     mode = "headphones" if HEADPHONES else "speaker mode"
     print(f"Listening... talking to '{MODEL}' ({engine.name} voice, {mode}). "
           f'Talk over it (or press Enter) to interrupt; say "continue" (or type c) to resume. '
-          f'Ctrl+C to stop.')
+          f'Conversation mode: say "Hey ducky" once, then keep talking naturally. Ctrl+C to stop.')
 
     try:
         while True:
