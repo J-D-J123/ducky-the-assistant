@@ -1,4 +1,4 @@
-# Aero the Assistant
+# Ducky the Assistant
 
 A fully local voice assistant using:
 
